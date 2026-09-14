@@ -23,6 +23,9 @@ import { Storage } from './storage.js';
 import { search, formatRecalledMemories } from './search.js';
 import { gradeTranscript } from './inferred-outcome.js';
 import { buildSessionContext } from './session-context.js';
+import { main as runHandoffCli, markAnnounced, HANDOFF_HELP } from './handoff-cli.js';
+import { listInbox } from './handoff.js';
+import { currentLane, normalizeLane } from './lane.js';
 import { rebuildRules } from './maintenance.js';
 import { repairStore } from './repair.js';
 const HELP = `przm-memory-mcp — memory CLI
@@ -40,8 +43,13 @@ Usage:
   przm-memory-mcp grade   --all [--dry-run]                     the same over every transcript
                                                                under ~/.claude/projects
   przm-memory-mcp context [--cwd <dir>] [--max-chars N]        print session-start context:
-                                                               handoff, rules, corrections,
-                                                               project memories
+                          [--lane L] [--session <id>]            inbox, handoff, rules,
+                                                               corrections, project memories
+  przm-memory-mcp inbox   [--lane L] [--all] [--new --session <id>]
+                                                               handoffs addressed to this lane
+  przm-memory-mcp handoff send|list|read|ack ...               send a handoff to another lane,
+                                                               list, read or acknowledge one
+                                                               (przm-memory-mcp handoff help)
   przm-memory-mcp rules   list [--scope <slug>] | rebuild      show the rules table, or throw it
                                                                away and re-derive it from the
                                                                correction and preference chunks
@@ -439,6 +447,8 @@ async function runGrade(argv) {
 const CONTEXT_OPTS = {
     cwd: { type: 'string' },
     'max-chars': { type: 'string' },
+    lane: { type: 'string' },
+    session: { type: 'string' },
 };
 /**
  * Print what a fresh session should know before its first message. Called by the
@@ -450,14 +460,19 @@ async function runContext(argv) {
     const maxChars = parseIntOpt(values['max-chars'], 'max-chars');
     try {
         const config = loadConfig();
+        const lane = values.lane ? normalizeLane(String(values.lane)) : currentLane();
         const storage = new Storage(config.dataDir);
         await storage.ensureReady();
         const out = await buildSessionContext(storage, config.dataDir, {
             cwd: values.cwd ? String(values.cwd) : process.cwd(),
+            lane,
             maxChars: maxChars ?? undefined,
         });
         if (out)
             process.stdout.write(out + '\n');
+        // Session start has now shown the inbox, so the user-prompt hook must not repeat it.
+        if (values.session)
+            markAnnounced(config.dataDir, String(values.session), listInbox(config.dataDir, lane).map(e => e.stamp));
     }
     catch {
         // Quiet by design.
@@ -530,6 +545,17 @@ async function main() {
         case 'context':
             await runContext(rest);
             return;
+        case 'inbox':
+        case 'handoff': {
+            if (sub === 'handoff' && (rest[0] === 'help' || rest[0] === '--help')) {
+                process.stdout.write(HANDOFF_HELP);
+                return;
+            }
+            const code = await runHandoffCli([sub, ...rest]);
+            if (code)
+                process.exit(code);
+            return;
+        }
         case 'rules':
             await runRules(rest);
             return;

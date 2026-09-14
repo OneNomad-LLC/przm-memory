@@ -24,6 +24,8 @@ import type { Storage, StoredChunk } from './storage.js';
 export interface SessionContextOptions {
     /** Working directory; its basename selects project memories. */
     cwd?: string;
+    /** The session's lane (src/lane.ts). Set, handoffs and checkpoints come from this lane only and its inbox is shown. */
+    lane?: string;
     /** Hard cap on the whole output. Roughly 4 chars per token. */
     maxChars?: number;
     maxRules?: number;
@@ -40,6 +42,9 @@ export interface SessionContextOptions {
 export declare function stripLeakedMarkup(content: string): string;
 /** Keep the first of any near-identical entries, drop leaked markup and anything too short to mean much. */
 export declare function dedupe(chunks: StoredChunk[]): StoredChunk[];
+export declare function ageOf(iso: string, now: Date): string;
+/** Handoffs another session addressed to this lane and nobody has picked up. */
+export declare function inboxSection(dataDir: string, lane: string | undefined, now?: Date): string;
 /**
  * Build the markdown that a SessionStart hook prints. Never throws on an empty
  * store; returns '' when there is nothing worth saying.
