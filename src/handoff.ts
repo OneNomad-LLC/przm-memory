@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { normalizeLane } from './lane.js';
 
 /**
  * HANDOFF NOTES — "where we left off" lifeline for cross-session continuity.
@@ -12,7 +13,13 @@ import { join } from 'node:path';
  *
  * Schema is opinionated on purpose: a fresh agent can pick up from any field
  * without hunting through prose.
+ *
+ * Since 1.6.0 a handoff carries the lane it was written in (see src/lane.ts). A
+ * handoff with `to` set is a message for another lane rather than a resume note:
+ * it waits in that lane's inbox until a session there acknowledges it.
  */
+
+export type HandoffStatus = 'pending' | 'picked-up';
 
 export interface HandoffNote {
   /** ISO timestamp of when this handoff was written */
@@ -37,10 +44,37 @@ export interface HandoffNote {
   decisions: string[];
   /** Anything else the next agent MUST know — hidden constraints, quirks, gotchas */
   notes: string;
+  /** Lane of the session that wrote it. Handoffs without one predate lanes and lane-scoped reads skip them. */
+  lane?: string;
+  /** Working directory name of the session that wrote it. */
+  project?: string;
+  /** Lane this handoff is addressed to. When set it is a message, not the writer's own resume note. */
+  to?: string;
+  /** Addressed handoffs only. */
+  status?: HandoffStatus;
+  pickedUpAt?: string;
+  pickedUpBy?: string;
+}
+
+/**
+ * Which handoffs a read may see. With neither field set nothing is filtered, which is
+ * what callers that predate lanes get. `lane` limits a read to handoffs written in that
+ * lane plus those addressed to it; `all` lifts the limit. `project` only breaks ties
+ * when picking the latest.
+ */
+export interface HandoffScope {
+  lane?: string;
+  all?: boolean;
+  project?: string;
 }
 
 function handoffDir(dataDir: string): string {
   return join(dataDir, 'handoffs');
+}
+
+/** One rolling file per session, written by hooks/engram_stop_hook.sh. */
+export function checkpointDir(dataDir: string): string {
+  return join(handoffDir(dataDir), 'checkpoints');
 }
 
 function stampFilename(): string {
@@ -56,9 +90,6 @@ function handoffMdPath(dataDir: string, stamp: string): string {
   return join(handoffDir(dataDir), `${stamp}.md`);
 }
 
-/**
- * Write a handoff note. Persists BOTH JSON (machine-readable) and markdown (human-readable).
- */
 /**
  * Some MCP clients bleed the closing tag of one parameter and the opening of the next into a
  * string value. Seen on a real handoff: currentTask ended with "</currentTask>" and the whole
@@ -78,8 +109,30 @@ function cleanNote<T extends Omit<HandoffNote, 'timestamp'>>(note: T): T {
   return out as T;
 }
 
-export function writeHandoff(dataDir: string, rawNote: Omit<HandoffNote, 'timestamp'>): HandoffNote {
+/**
+ * Atomic write for the JSON+MD pair. Two non-atomic writeFileSync calls in a row could leave
+ * a JSON file with no markdown sibling (or vice versa) on crash, breaking the pairing
+ * readHandoff relies on. Stage both as .tmp first, then rename both -- minimizes the crash
+ * window to the gap between two consecutive renameSync calls (sub-millisecond). True
+ * cross-file atomicity isn't expressible in POSIX; this is the best practical approximation.
+ */
+function persist(dataDir: string, stamp: string, note: HandoffNote): void {
+  const jsonPath = handoffJsonPath(dataDir, stamp);
+  const mdPath = handoffMdPath(dataDir, stamp);
+  writeFileSync(`${jsonPath}.tmp`, JSON.stringify(note, null, 2), 'utf-8');
+  writeFileSync(`${mdPath}.tmp`, formatHandoffMarkdown(note), 'utf-8');
+  renameSync(`${jsonPath}.tmp`, jsonPath);
+  renameSync(`${mdPath}.tmp`, mdPath);
+}
+
+/** Write a handoff note. Persists BOTH JSON (machine-readable) and markdown (human-readable). */
+export function writeHandoff(dataDir: string, rawNote: Omit<HandoffNote, 'timestamp'>): HandoffNote & { stamp: string } {
   const note = cleanNote(rawNote);
+  if (note.lane) note.lane = normalizeLane(note.lane);
+  if (note.to) {
+    note.to = normalizeLane(note.to);
+    note.status = note.status ?? 'pending';
+  }
   const dir = handoffDir(dataDir);
   // 0700 = owner-only access. Handoffs contain "where we left off"
   // session context -- file refs, decisions, open questions. Not
@@ -95,42 +148,23 @@ export function writeHandoff(dataDir: string, rawNote: Omit<HandoffNote, 'timest
   for (let n = 2; existsSync(handoffJsonPath(dataDir, stamp)); n++) {
     stamp = `${stampFilename()}-${n}`;
   }
-
-  // Atomic write for the JSON+MD pair. Two non-atomic writeFileSync
-  // calls in a row could leave a JSON file with no markdown sibling
-  // (or vice versa) on crash, breaking the pairing readHandoff
-  // relies on. Stage both as .tmp first, then rename both -- minimizes
-  // the crash window to the gap between two consecutive renameSync
-  // calls (sub-millisecond). True cross-file atomicity isn't
-  // expressible in POSIX; this is the best practical approximation.
-  const jsonPath = handoffJsonPath(dataDir, stamp);
-  const mdPath = handoffMdPath(dataDir, stamp);
-  writeFileSync(`${jsonPath}.tmp`, JSON.stringify(full, null, 2), 'utf-8');
-  writeFileSync(`${mdPath}.tmp`, formatHandoffMarkdown(full), 'utf-8');
-  renameSync(`${jsonPath}.tmp`, jsonPath);
-  renameSync(`${mdPath}.tmp`, mdPath);
-
-  return full;
+  persist(dataDir, stamp, full);
+  return { ...full, stamp };
 }
 
-/**
- * Read the most recent handoff, or a specific one by stamp or name.
- *
- * Identifier resolution order:
- *   1. No identifier → latest timestamped handoff
- *   2. Identifier matches stamp regex → load by stamp
- *   3. Otherwise → scan handoff JSONs for `name` field match (newest match wins)
- */
 // Timestamped handoff filenames look like "2026-04-22_14-32-05-123Z" (what
-// stampFilename() produces). The rolling `session-checkpoint.json` written
-// by engram_stop_hook.sh does NOT match this shape, so it won't shadow real
-// handoffs when readHandoff() picks the latest.
+// stampFilename() produces). Anything else in the directory -- the pre-1.6
+// rolling `session-checkpoint.json`, the checkpoints/ folder -- is not a
+// handoff and never shadows one.
+//
+// A second handoff written in the same millisecond gets a "-2" (then "-3")
+// suffix from writeHandoff, so that is allowed too.
 //
 // SECURITY: anchored at end with optional millisecond+timezone suffix.
 // An earlier version was unanchored, which allowed a `stamp` like
 // "2026-01-01_00-00-00/../../.pyre/credentials" to match and then be
 // joined into the file path -- arbitrary `.json` file read.
-const STAMP_RE = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+Z?)?$/;
+const STAMP_RE = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+Z?)?(-\d+)?$/;
 
 // Defense-in-depth path-safety check on any user-provided identifier
 // before it touches the filesystem. Even with STAMP_RE anchored, a
@@ -144,37 +178,6 @@ function isSafeHandoffIdentifier(identifier: string): boolean {
   return true;
 }
 
-export function readHandoff(dataDir: string, identifier?: string): HandoffNote | null {
-  const dir = handoffDir(dataDir);
-  if (!existsSync(dir)) return null;
-
-  if (!identifier) {
-    const allJson = readdirSync(dir).filter(f => f.endsWith('.json'));
-    const timestamped = allJson.filter(f => STAMP_RE.test(f.replace(/\.json$/, ''))).sort().reverse();
-    const pick = timestamped[0] ?? allJson.sort().reverse()[0];
-    if (!pick) return null;
-    return loadHandoffFile(handoffJsonPath(dataDir, pick.replace(/\.json$/, '')));
-  }
-
-  if (!isSafeHandoffIdentifier(identifier)) return null;
-
-  if (STAMP_RE.test(identifier)) {
-    return loadHandoffFile(handoffJsonPath(dataDir, identifier));
-  }
-
-  // Name lookup — scan newest first, return first hit.
-  const stamps = readdirSync(dir)
-    .filter(f => f.endsWith('.json'))
-    .map(f => f.replace(/\.json$/, ''))
-    .sort()
-    .reverse();
-  for (const stamp of stamps) {
-    const note = loadHandoffFile(handoffJsonPath(dataDir, stamp));
-    if (note?.name === identifier) return note;
-  }
-  return null;
-}
-
 function loadHandoffFile(path: string): HandoffNote | null {
   if (!existsSync(path)) return null;
   try {
@@ -184,45 +187,134 @@ function loadHandoffFile(path: string): HandoffNote | null {
   }
 }
 
+/** Every timestamped handoff, newest first. */
+function loadAll(dataDir: string): { stamp: string; note: HandoffNote }[] {
+  const dir = handoffDir(dataDir);
+  if (!existsSync(dir)) return [];
+  const out: { stamp: string; note: HandoffNote }[] = [];
+  const stamps = readdirSync(dir)
+    .filter(f => f.endsWith('.json'))
+    .map(f => f.replace(/\.json$/, ''))
+    .filter(s => STAMP_RE.test(s))
+    .sort()
+    .reverse();
+  for (const stamp of stamps) {
+    const note = loadHandoffFile(handoffJsonPath(dataDir, stamp));
+    if (note) out.push({ stamp, note });
+  }
+  return out;
+}
+
+function visible(note: HandoffNote, scope: HandoffScope | undefined): boolean {
+  if (!scope || scope.all || !scope.lane) return true;
+  const lane = normalizeLane(scope.lane);
+  return note.lane === lane || note.to === lane;
+}
+
+/** Same-project notes first, then newest. */
+function pickLatest<T extends HandoffNote>(notes: T[], project: string | undefined): T | null {
+  if (!notes.length) return null;
+  const sorted = [...notes].sort((a, b) => (b.timestamp ?? '').localeCompare(a.timestamp ?? ''));
+  if (project) {
+    const same = sorted.find(n => n.project === project);
+    if (same) return same;
+  }
+  return sorted[0];
+}
+
+/**
+ * Read the most recent handoff, or a specific one by stamp or name.
+ *
+ * Identifier resolution order:
+ *   1. No identifier → latest resume note in scope (addressed handoffs are messages, never a resume note)
+ *   2. Identifier matches stamp regex → load by stamp
+ *   3. Otherwise → scan handoff JSONs for `name` field match (newest match wins)
+ */
+export function readHandoff(dataDir: string, identifier?: string, scope?: HandoffScope): HandoffNote | null {
+  if (!identifier) {
+    const notes = loadAll(dataDir).map(e => e.note).filter(n => !n.to && visible(n, scope));
+    return pickLatest(notes, scope?.project);
+  }
+
+  if (!isSafeHandoffIdentifier(identifier)) return null;
+
+  if (STAMP_RE.test(identifier)) {
+    const note = loadHandoffFile(handoffJsonPath(dataDir, identifier));
+    return note && visible(note, scope) ? note : null;
+  }
+
+  return loadAll(dataDir).find(e => e.note.name === identifier && visible(e.note, scope))?.note ?? null;
+}
+
 export interface HandoffListEntry {
   stamp: string;
   timestamp: string;
   reason: string;
   currentTask: string;
   name?: string;
+  lane?: string;
+  project?: string;
+  to?: string;
+  status?: HandoffStatus;
+}
+
+function toEntry(stamp: string, note: HandoffNote): HandoffListEntry {
+  return {
+    stamp,
+    timestamp: note.timestamp,
+    reason: note.reason,
+    currentTask: note.currentTask,
+    ...(note.name ? { name: note.name } : {}),
+    ...(note.lane ? { lane: note.lane } : {}),
+    ...(note.project ? { project: note.project } : {}),
+    ...(note.to ? { to: note.to, status: note.status ?? 'pending' } : {}),
+  };
 }
 
 /**
  * List handoff checkpoints, newest first. Includes the optional `name` so a
  * caller can present a list-and-pick UI keyed on either stamp or name.
  */
-export function listHandoffs(dataDir: string, limit = 10): HandoffListEntry[] {
-  const dir = handoffDir(dataDir);
-  if (!existsSync(dir)) return [];
+export function listHandoffs(dataDir: string, limit = 10, scope?: HandoffScope): HandoffListEntry[] {
+  return loadAll(dataDir)
+    .filter(e => visible(e.note, scope))
+    .slice(0, limit)
+    .map(e => toEntry(e.stamp, e.note));
+}
 
-  const stamps = readdirSync(dir)
+/** Handoffs addressed to a lane, newest first. Picked-up ones only when asked for. */
+export function listInbox(dataDir: string, lane: string, opts: { includePickedUp?: boolean } = {}): HandoffListEntry[] {
+  const target = normalizeLane(lane);
+  return loadAll(dataDir)
+    .filter(e => e.note.to === target && (opts.includePickedUp || e.note.status !== 'picked-up'))
+    .map(e => toEntry(e.stamp, e.note));
+}
+
+/**
+ * Mark a handoff addressed to `lane` as picked up. Returns null when there is no such
+ * handoff or it was addressed to a different lane; a second ack returns it unchanged.
+ */
+export function ackHandoff(dataDir: string, stamp: string, lane: string): HandoffNote | null {
+  if (!isSafeHandoffIdentifier(stamp) || !STAMP_RE.test(stamp)) return null;
+  const note = loadHandoffFile(handoffJsonPath(dataDir, stamp));
+  const target = normalizeLane(lane);
+  if (!note || note.to !== target) return null;
+  if (note.status === 'picked-up') return note;
+  const updated: HandoffNote = { ...note, status: 'picked-up', pickedUpAt: new Date().toISOString(), pickedUpBy: target };
+  persist(dataDir, stamp, updated);
+  return updated;
+}
+
+/** The newest per-session checkpoint in scope, same project first. */
+export function readLatestCheckpoint(dataDir: string, scope?: HandoffScope): HandoffNote | null {
+  const dir = checkpointDir(dataDir);
+  if (!existsSync(dir)) return null;
+  const notes = readdirSync(dir)
     .filter(f => f.endsWith('.json'))
-    .map(f => f.replace(/\.json$/, ''))
-    .sort()
-    .reverse()
-    .slice(0, limit);
-
-  const results: HandoffListEntry[] = [];
-  for (const stamp of stamps) {
-    try {
-      const note = JSON.parse(readFileSync(handoffJsonPath(dataDir, stamp), 'utf-8')) as HandoffNote;
-      results.push({
-        stamp,
-        timestamp: note.timestamp,
-        reason: note.reason,
-        currentTask: note.currentTask,
-        ...(note.name ? { name: note.name } : {}),
-      });
-    } catch {
-      // Skip malformed
-    }
-  }
-  return results;
+    .map(f => loadHandoffFile(join(dir, f)))
+    .filter((n): n is HandoffNote => n != null)
+    .filter(n => !scope || scope.all || !scope.lane || n.lane === normalizeLane(scope.lane));
+  return pickLatest(notes, scope?.project);
 }
 
 function formatHandoffMarkdown(note: HandoffNote): string {
@@ -233,6 +325,8 @@ function formatHandoffMarkdown(note: HandoffNote): string {
     `**Reason:** ${note.reason}`,
     `**Timestamp:** ${note.timestamp}`,
     note.sessionId ? `**Session:** ${note.sessionId}` : '',
+    note.lane ? `**Lane:** ${note.lane}${note.project ? ` (${note.project})` : ''}` : '',
+    note.to ? `**To:** ${note.to} (${note.status ?? 'pending'}${note.pickedUpAt ? ` ${note.pickedUpAt}` : ''})` : '',
     '',
     '## Current Task',
     note.currentTask || '_unspecified_',

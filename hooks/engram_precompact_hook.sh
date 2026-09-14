@@ -21,14 +21,19 @@
 DATA_DIR="${PRZM_MEMORY_DATA_DIR:-${ENGRAM_DATA_DIR:-${SMART_MEMORY_DATA_DIR:-$HOME/.claude/przm-memory}}}"
 WINDOW_SEC="${ENGRAM_PRECOMPACT_WINDOW_SEC:-300}"
 
-# Claude Code passes { session_id, transcript_path, trigger, ... } on stdin.
+# Claude Code passes { session_id, transcript_path, cwd, trigger, ... } on stdin.
 # Capture it so we can parse the transcript for auto-extraction.
 PAYLOAD=$(cat 2>/dev/null || true)
+
+# shellcheck source=lane.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lane.sh" 2>/dev/null
+LANE="$(przm_lane 2>/dev/null || printf 'claude')"
 
 RESULT=$(ENGRAM_DATA_DIR="$DATA_DIR" \
          ENGRAM_HANDOFF_DIR="$DATA_DIR/handoffs" \
          WINDOW_SEC="$WINDOW_SEC" \
          CC_PAYLOAD="$PAYLOAD" \
+         PRZM_LANE="$LANE" \
          node -e "
   (() => {
     const fs = require('fs');
@@ -36,22 +41,33 @@ RESULT=$(ENGRAM_DATA_DIR="$DATA_DIR" \
 
     const handoffDir = process.env.ENGRAM_HANDOFF_DIR;
     const windowMs = Number(process.env.WINDOW_SEC) * 1000;
+    const lane = process.env.PRZM_LANE || 'claude';
+    const stampRe = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+Z?)?(-\d+)?\.json$/;
 
-    // Phase 1 — if a fresh handoff already exists (Claude wrote one during
-    // the session, whatever reason it gave), reuse it and approve.
+    let payload = {};
+    try { payload = JSON.parse(process.env.CC_PAYLOAD || '{}'); } catch {}
+    const transcriptPath = payload.transcript_path;
+    const sessionId = payload.session_id || null;
+    const project = (path.basename(payload.cwd || process.cwd()) || '').toLowerCase();
+
+    // Phase 1 — if a fresh handoff from this lane already exists (Claude wrote
+    // one during the session, whatever reason it gave), reuse it and approve.
+    // Another lane's handoff, or one addressed to a different lane, never counts.
     try {
       if (fs.existsSync(handoffDir)) {
         const files = fs.readdirSync(handoffDir)
-          .filter(f => f.endsWith('.json'))
+          .filter(f => stampRe.test(f))
           .sort()
           .reverse();
-        if (files.length) {
-          const latest = JSON.parse(fs.readFileSync(path.join(handoffDir, files[0]), 'utf8'));
-          const age = Date.now() - new Date(latest.timestamp).getTime();
-          if (isFinite(age) && age >= 0 && age <= windowMs) {
+        for (const f of files) {
+          const note = JSON.parse(fs.readFileSync(path.join(handoffDir, f), 'utf8'));
+          const age = Date.now() - new Date(note.timestamp).getTime();
+          if (!isFinite(age) || age > windowMs) break;
+          if (note.lane !== lane || note.to) continue;
+          if (age >= 0) {
             return console.log(JSON.stringify({
               decision: 'approve',
-              reason: 'Fresh handoff (' + (latest.name || latest.reason) + ') already on disk — proceeding with compaction.',
+              reason: 'Fresh handoff (' + (note.name || note.reason) + ') already on disk — proceeding with compaction.',
             }));
           }
         }
@@ -59,15 +75,12 @@ RESULT=$(ENGRAM_DATA_DIR="$DATA_DIR" \
     } catch { /* fall through to auto-generate */ }
 
     // Phase 2 — auto-generate a mechanical handoff from the transcript.
-    let payload = {};
-    try { payload = JSON.parse(process.env.CC_PAYLOAD || '{}'); } catch {}
-    const transcriptPath = payload.transcript_path;
-    const sessionId = payload.session_id || null;
-
     const handoff = {
       timestamp: new Date().toISOString(),
       sessionId,
       reason: 'compact',
+      lane,
+      ...(project && project !== '/' && project !== '.' ? { project } : {}),
       currentTask: '',
       completed: [],
       nextSteps: [],
@@ -152,6 +165,7 @@ RESULT=$(ENGRAM_DATA_DIR="$DATA_DIR" \
         '',
         '**Reason:** ' + handoff.reason + '  (auto-generated)',
         handoff.sessionId ? '**Session:** ' + handoff.sessionId : '',
+        '**Lane:** ' + handoff.lane + (handoff.project ? ' (' + handoff.project + ')' : ''),
         '',
         '## Current Task',
         handoff.currentTask || '_unspecified_',

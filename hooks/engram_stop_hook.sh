@@ -9,17 +9,24 @@
 #    interrupt flow; Claude's MCP instructions already push proactive
 #    memory-ingest / memory-kg-add / persona_signal calls.
 #
-# The checkpoint file lives alongside real handoffs but uses reason=
-# "context-pressure" so it won't confuse the PreCompact freshness check
-# (which only matches reason="compact").
+# Each session keeps its own checkpoint at handoffs/checkpoints/<session>.json,
+# tagged with its lane (see hooks/lane.sh) and project. Before 1.6.0 every
+# session on the machine overwrote one shared session-checkpoint.json, so a
+# session could resume from another account's work; that file is removed here.
+# Checkpoints and announcement records older than two weeks are pruned.
 
 DATA_DIR="${PRZM_MEMORY_DATA_DIR:-${ENGRAM_DATA_DIR:-${SMART_MEMORY_DATA_DIR:-$HOME/.claude/przm-memory}}}"
 
-# Capture the Claude Code payload: { session_id, transcript_path, stop_hook_active }.
+# Capture the Claude Code payload: { session_id, transcript_path, cwd, stop_hook_active }.
 PAYLOAD=$(cat 2>/dev/null || true)
+
+# shellcheck source=lane.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lane.sh" 2>/dev/null
+LANE="$(przm_lane 2>/dev/null || printf 'claude')"
 
 ENGRAM_DATA_DIR="$DATA_DIR" \
 CC_PAYLOAD="$PAYLOAD" \
+PRZM_LANE="$LANE" \
 node -e "
   (() => {
     const fs = require('fs');
@@ -28,10 +35,15 @@ node -e "
     let payload = {};
     try { payload = JSON.parse(process.env.CC_PAYLOAD || '{}'); } catch {}
     const transcriptPath = payload.transcript_path;
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) return;
+    const sessionId = payload.session_id;
+    if (!transcriptPath || !sessionId || !fs.existsSync(transcriptPath)) return;
 
     const handoffDir = path.join(process.env.ENGRAM_DATA_DIR, 'handoffs');
-    const checkpointPath = path.join(handoffDir, 'session-checkpoint.json');
+    const checkpointDir = path.join(handoffDir, 'checkpoints');
+    const safeSession = String(sessionId).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+    const checkpointPath = path.join(checkpointDir, safeSession + '.json');
+    const cwd = payload.cwd || process.cwd();
+    const project = (path.basename(cwd) || '').toLowerCase();
 
     let lines;
     try {
@@ -83,8 +95,10 @@ node -e "
 
     const checkpoint = {
       timestamp: new Date().toISOString(),
-      sessionId: payload.session_id || null,
+      sessionId,
       reason: 'context-pressure',
+      lane: process.env.PRZM_LANE || 'claude',
+      ...(project && project !== '/' && project !== '.' ? { project } : {}),
       currentTask: userMsgs.length ? userMsgs[userMsgs.length - 1].split('\n')[0].slice(0, 200) : '',
       completed: [...writeSet].slice(-20).map(f => 'edited ' + f),
       nextSteps: [],
@@ -92,20 +106,31 @@ node -e "
       fileRefs: [...fileSet].slice(-30),
       decisions: commits.slice(-10).map(m => 'commit: ' + m),
       notes:
-        'Rolling session checkpoint from engram_stop_hook.sh. Mechanical ' +
+        'Rolling checkpoint for this session from engram_stop_hook.sh. Mechanical ' +
         'extraction — overwritten on every assistant turn. If /compact ' +
         'never ran, this is the freshest lifeline. Tool-distilled handoffs ' +
-        '(via memory-handoff-write) live alongside this file as timestamped entries.' +
+        '(via memory-handoff-write) live one folder up as timestamped entries.' +
         (lastAssistantText ? '\n\nLast assistant note: ' +
           lastAssistantText.trim().split('\n').slice(-3).join(' ').slice(0, 300) : ''),
     };
 
     try {
-      if (!fs.existsSync(handoffDir)) fs.mkdirSync(handoffDir, { recursive: true });
-      // Overwrite a single rolling checkpoint (not a new timestamped file)
-      // so the handoff dir doesn't grow per-turn.
-      fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2), 'utf8');
+      if (!fs.existsSync(checkpointDir)) fs.mkdirSync(checkpointDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(checkpointPath + '.tmp', JSON.stringify(checkpoint, null, 2), 'utf8');
+      fs.renameSync(checkpointPath + '.tmp', checkpointPath);
     } catch { /* non-fatal — approve regardless */ }
+
+    // The shared pre-1.6 checkpoint, and per-session records nobody has touched in two weeks.
+    try { fs.rmSync(path.join(handoffDir, 'session-checkpoint.json'), { force: true }); } catch {}
+    const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    for (const dir of [checkpointDir, path.join(handoffDir, 'announced')]) {
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          const p = path.join(dir, f);
+          if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true });
+        }
+      } catch {}
+    }
   })();
 " 2>/dev/null
 

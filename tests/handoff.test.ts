@@ -10,11 +10,11 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { writeHandoff, readHandoff, listHandoffs } from '../src/handoff.js';
+import { writeHandoff, readHandoff, listHandoffs, listInbox, ackHandoff, readLatestCheckpoint, checkpointDir } from '../src/handoff.js';
 
 function tmpDir() {
   const dir = mkdtempSync(join(tmpdir(), 'engram-handoff-'));
@@ -132,6 +132,114 @@ describe('handoff sanitising', () => {
       assert.equal(written.currentTask, 'Argos wave two running.');
       assert.deepEqual(written.completed, ['done thing']);
       assert.equal(readHandoff(dir)?.currentTask, 'Argos wave two running.');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/** Set a written handoff's timestamp so ordering does not depend on the clock. */
+function stampAt(dir: string, stamp: string, iso: string) {
+  const path = join(dir, 'handoffs', `${stamp}.json`);
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), timestamp: iso }));
+}
+
+describe('handoff lanes', () => {
+  it('reads the latest resume note from the lane it is asked for', () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      const personal = writeHandoff(dir, baseNote({ lane: 'claude', currentTask: 'personal task' }));
+      const work = writeHandoff(dir, baseNote({ lane: 'claude-work', currentTask: 'work task' }));
+      stampAt(dir, personal.stamp, '2026-01-01T00:00:00.000Z');
+      stampAt(dir, work.stamp, '2026-02-01T00:00:00.000Z');
+
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude' })?.currentTask, 'personal task');
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude-work' })?.currentTask, 'work task');
+      assert.equal(readHandoff(dir, work.stamp, { lane: 'claude' }), null, 'a stamp from another lane is not readable');
+      assert.equal(readHandoff(dir, work.stamp, { all: true })?.currentTask, 'work task');
+      assert.deepEqual(listHandoffs(dir, 10, { lane: 'claude' }).map(e => e.currentTask), ['personal task']);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('skips handoffs written before lanes existed unless all lanes are asked for', () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      writeHandoff(dir, baseNote({ currentTask: 'pre-lane task' }));
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude' }), null);
+      assert.equal(readHandoff(dir, undefined, { all: true })?.currentTask, 'pre-lane task');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('prefers the same project when picking the latest', () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      const mine = writeHandoff(dir, baseNote({ lane: 'claude', project: 'argos', currentTask: 'argos task' }));
+      const other = writeHandoff(dir, baseNote({ lane: 'claude', project: 'nexus', currentTask: 'nexus task' }));
+      stampAt(dir, mine.stamp, '2026-01-01T00:00:00.000Z');
+      stampAt(dir, other.stamp, '2026-02-01T00:00:00.000Z');
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude', project: 'argos' })?.currentTask, 'argos task');
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude', project: 'unknown' })?.currentTask, 'nexus task');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('delivers an addressed handoff to the other lane, never as the sender\'s resume note', () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      const sent = writeHandoff(dir, baseNote({ lane: 'claude', project: 'pryzm-ai-poc', to: 'Claude-Work', currentTask: 'push the branch' }));
+      assert.equal(sent.to, 'claude-work');
+      assert.equal(sent.status, 'pending');
+
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude' }), null);
+      assert.equal(readHandoff(dir, undefined, { lane: 'claude-work' }), null, 'a message is not a resume note for the recipient either');
+      assert.deepEqual(listInbox(dir, 'claude').map(e => e.stamp), []);
+
+      const inbox = listInbox(dir, 'claude-work');
+      assert.equal(inbox.length, 1);
+      assert.equal(inbox[0].lane, 'claude');
+      assert.equal(inbox[0].project, 'pryzm-ai-poc');
+      assert.equal(readHandoff(dir, sent.stamp, { lane: 'claude-work' })?.currentTask, 'push the branch');
+      assert.equal(readHandoff(dir, sent.stamp, { lane: 'somebody-else' }), null);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('acks only from the addressed lane, once, and keeps the record', () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      const sent = writeHandoff(dir, baseNote({ lane: 'claude', to: 'claude-work', currentTask: 'push the branch' }));
+      assert.equal(ackHandoff(dir, sent.stamp, 'claude'), null);
+      assert.equal(ackHandoff(dir, '../../etc/passwd', 'claude-work'), null);
+
+      const acked = ackHandoff(dir, sent.stamp, 'claude-work');
+      assert.equal(acked?.status, 'picked-up');
+      assert.equal(acked?.pickedUpBy, 'claude-work');
+      assert.equal(listInbox(dir, 'claude-work').length, 0);
+      assert.equal(listInbox(dir, 'claude-work', { includePickedUp: true })[0].status, 'picked-up');
+      assert.equal(ackHandoff(dir, sent.stamp, 'claude-work')?.pickedUpAt, acked?.pickedUpAt);
+      assert.match(readFileSync(join(dir, 'handoffs', `${sent.stamp}.md`), 'utf8'), /\*\*To:\*\* claude-work \(picked-up/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('reads per-session checkpoints from the lane only', () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      mkdirSync(checkpointDir(dir), { recursive: true });
+      const cp = (session: string, lane: string, task: string, ts: string) =>
+        writeFileSync(join(checkpointDir(dir), `${session}.json`), JSON.stringify({ ...baseNote({ lane, currentTask: task, reason: 'context-pressure' }), sessionId: session, timestamp: ts }));
+      cp('a', 'claude', 'personal crash', '2026-01-01T00:00:00.000Z');
+      cp('b', 'claude-work', 'work crash', '2026-03-01T00:00:00.000Z');
+      assert.equal(readLatestCheckpoint(dir, { lane: 'claude' })?.currentTask, 'personal crash');
+      assert.equal(readLatestCheckpoint(dir, { lane: 'claude-work' })?.currentTask, 'work crash');
+      assert.equal(readLatestCheckpoint(dir, { lane: 'nobody' }), null);
     } finally {
       cleanup();
     }

@@ -288,20 +288,45 @@ Context compaction is irreversible, and if the window fills completely before co
 - `engram-handoff-read` loads the latest handoff (or a specific one by stamp). Agents call it at session start to pick up from exactly where the previous session stopped.
 - `engram-context-pressure` is a self-nudge: the agent reports its own pressure level (`ok`/`warm`/`hot`/`critical`) and gets back a deterministic action plan — when to save, when to write the handoff, when to compact early rather than riding the window to the edge. Passing `phaseBoundary=true` (task complete, pivoting focus, finishing a subsystem) overrides level and forces a proactive compact; the reasoning is that pivots thrash Anthropic's 5-minute prompt cache anyway, so eating that miss at the boundary is effectively free and avoids carrying the verbose tool output of the finished phase into the next one.
 
-The bundled `engram_precompact_hook.sh` runs autonomously before compaction: it approves immediately if a fresh handoff (`reason="compact"`, written within the last 5 minutes) already exists; otherwise it auto-generates a mechanical handoff from the transcript (recent user messages, edited files, tool calls, commits) and approves. `/compact` "just works" — no two-step ritual.
+The bundled `engram_precompact_hook.sh` runs autonomously before compaction: it approves immediately if a fresh handoff from the same lane (written within the last 5 minutes) already exists; otherwise it auto-generates a mechanical handoff from the transcript (recent user messages, edited files, tool calls, commits) and approves. `/compact` "just works" — no two-step ritual.
+
+#### Lanes and handoffs between sessions
+
+One machine can run Claude Code under more than one config directory, a personal `~/.claude` and a work `~/.claude-work` for example, and all of those sessions share one store. Before 1.6.0 they also shared one crash checkpoint and one "latest handoff", so a work session could open on a personal session's work and the other way round.
+
+A session's lane is the name of its config directory: `~/.claude` is `claude`, `~/.claude-work` is `claude-work`, and `PRZM_MEMORY_LANE` overrides it. Handoffs record the lane and project (working directory name) they were written in. Session start, `memory-handoff-read`, `memory-handoff-list` and the pre-compact hook only see the session's own lane, preferring the current project; pass `lane` or `all` to look elsewhere. Handoffs written before 1.6.0 carry no lane and are left out. The stop hook keeps one checkpoint per session under `handoffs/checkpoints/` instead of one shared file.
+
+A handoff can also be sent to another lane. `memory-handoff-write` with `to: "claude-work"` (or `przm-memory-mcp handoff send --to claude-work --task "..."` from a shell) puts it in that lane's inbox instead of saving it as the sender's resume note. Sessions in that lane see it at session start and, with the user-prompt hook installed, on their next prompt if it arrives mid-session. Each session is told about a handoff once. The session is told to treat it as a request and confirm with the user before acting; `memory-handoff-inbox` lists pending ones and `memory-handoff-ack` marks one picked up. Messages land at a turn boundary: nothing wakes an idle session.
 
 #### Installing the hooks
 
-przm Memory ships two optional Claude Code hooks: `hooks/engram_precompact_hook.sh` (runs before `/compact`) and `hooks/engram_stop_hook.sh` (runs at session end to write a rolling checkpoint). Wire them in `~/.claude/settings.json` (or your project's `.claude/settings.json`):
+przm Memory ships five optional Claude Code hooks, all bash:
+
+- `hooks/engram_sessionstart_hook.sh` (SessionStart): prints the inbox, the latest handoff or checkpoint from the lane, rules, corrections and project memories
+- `hooks/engram_userprompt_hook.sh` (UserPromptSubmit): announces handoffs addressed to the lane that arrived since the session was last told
+- `hooks/engram_stop_hook.sh` (Stop): writes the session's rolling checkpoint and grades recall
+- `hooks/engram_precompact_hook.sh` (PreCompact): writes a compact-time handoff unless a fresh one exists
+- `hooks/engram_sessionend_hook.sh` (SessionEnd): final recall grading
+
+Wire them in `~/.claude/settings.json` (or your project's `.claude/settings.json`), and in every other config directory whose sessions should share the store:
 
 ```json
 {
   "hooks": {
-    "PreCompact": [
-      { "type": "command", "command": "/absolute/path/to/przm-memory/hooks/engram_precompact_hook.sh" }
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "bash /absolute/path/to/przm-memory/hooks/engram_sessionstart_hook.sh" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "bash /absolute/path/to/przm-memory/hooks/engram_userprompt_hook.sh" }] }
     ],
     "Stop": [
-      { "type": "command", "command": "/absolute/path/to/przm-memory/hooks/engram_stop_hook.sh" }
+      { "hooks": [{ "type": "command", "command": "bash /absolute/path/to/przm-memory/hooks/engram_stop_hook.sh" }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "bash /absolute/path/to/przm-memory/hooks/engram_precompact_hook.sh" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "bash /absolute/path/to/przm-memory/hooks/engram_sessionend_hook.sh" }] }
     ]
   }
 }
@@ -509,7 +534,7 @@ For shared/cloud deployments where many users share one process, it also speaks 
 
 ## Tools
 
-The MCP server exposes 29 tools across six groups. Several earlier tools (`engram-format`, `engram-check-duplicate`, `engram-extract-rules`, `engram-taxonomy`, `engram-kg-stats`) were folded into their parent tools in 1.0.0-beta.6 — pass the relevant flag or mode to the parent instead. 1.0.0-beta.8 added the Handoff tools for cross-session continuity. 1.0.0 adds the memory origin field (user vs derived), the scratch tier, and `memory-scratch-promote`.
+The MCP server exposes 31 tools across six groups. Several earlier tools (`engram-format`, `engram-check-duplicate`, `engram-extract-rules`, `engram-taxonomy`, `engram-kg-stats`) were folded into their parent tools in 1.0.0-beta.6 — pass the relevant flag or mode to the parent instead. 1.0.0-beta.8 added the Handoff tools for cross-session continuity. 1.0.0 adds the memory origin field (user vs derived), the scratch tier, and `memory-scratch-promote`.
 
 > **Backward compatibility:** tools were renamed from `engram-*` to `memory-*` in v1.0.0-beta.7. As of 1.3.0 the `engram-*` aliases are opt-in: set `PRZM_MEMORY_LEGACY_ALIASES=1` to register them. They double the tool surface every MCP client pays for, so leave them off unless an old config still calls `engram-*` names. They will be removed in v2.
 
@@ -547,8 +572,11 @@ The MCP server exposes 29 tools across six groups. Several earlier tools (`engra
 
 | Tool | What it does |
 |------|-------------|
-| `memory-handoff-write` | Structured "where we left off" snapshot — currentTask, completed, nextSteps, openQuestions, fileRefs, decisions, notes. Written before compaction or session end so a fresh session can resume without re-explanation. |
-| `memory-handoff-read` | Load the latest handoff (or one by stamp; `list=true` for recent stamps). Call at session start to pick up where the prior session left off. |
+| `memory-handoff-write` | Structured "where we left off" snapshot — currentTask, completed, nextSteps, openQuestions, fileRefs, decisions, notes. Written before compaction or session end so a fresh session can resume without re-explanation. Tagged with the session's lane and project; pass `to` to send it to another lane's inbox instead. |
+| `memory-handoff-read` | Load the latest handoff from the session's lane, same project first (or one by name or stamp; `lane` or `all` to look outside the lane). Call at session start to pick up where the prior session left off. |
+| `memory-handoff-list` | Recent handoffs in the lane, newest first, with stamp, reason, name and any `to`. |
+| `memory-handoff-inbox` | Handoffs other sessions addressed to this lane that nobody has picked up. |
+| `memory-handoff-ack` | Mark a handoff addressed to this lane picked up. |
 | `memory-context-pressure` | Self-assess context window pressure (`ok`/`warm`/`hot`/`critical`) and receive a deterministic action plan — when to save memories, when to write a handoff, when to invoke `/compact`. Pass `phaseBoundary=true` at natural task/phase boundaries to force a proactive compact regardless of level (pivots thrash the cache anyway — compacting at the boundary is a free lunch). |
 
 ### Governance
@@ -637,7 +665,11 @@ Everything lives locally:
 │   └── YYYY-MM-DD.md
 ├── handoffs/             # Cross-session "where we left off" snapshots
 │   ├── YYYY-MM-DD_HH-MM-SS.json
-│   └── YYYY-MM-DD_HH-MM-SS.md
+│   ├── YYYY-MM-DD_HH-MM-SS.md
+│   ├── checkpoints/      # One rolling crash checkpoint per session
+│   │   └── <session-id>.json
+│   └── announced/        # Which inbox handoffs each session has been told about
+│       └── <session-id>.json
 └── lance/                # LanceDB tables
     ├── chunks.lance/     # Memory chunks with embeddings
     ├── daily_logs.lance/ # Extraction logs

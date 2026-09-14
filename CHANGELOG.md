@@ -5,6 +5,50 @@ All notable changes to `@onenomad/przm-memory` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-09-14
+
+Found by running Claude Code under two config directories on one machine. A
+work session opened on a personal session's crash checkpoint, because every
+session shares the store and there was one checkpoint and one "latest
+handoff" for all of them.
+
+### Added
+
+- **Lanes.** A session's lane is the name of its Claude Code config directory
+  (`~/.claude` is `claude`, `~/.claude-work` is `claude-work`;
+  `PRZM_MEMORY_LANE` overrides it). Handoffs record the lane and project they
+  were written in. `src/lane.ts` and `hooks/lane.sh` compute the same name and
+  a test holds them to each other.
+- **Handoffs between lanes.** `memory-handoff-write` takes `to` and puts the
+  handoff in that lane's inbox instead of saving it as the sender's resume
+  note. New tools `memory-handoff-inbox` and `memory-handoff-ack`, and CLI
+  commands `przm-memory-mcp inbox` and `przm-memory-mcp handoff
+  send|list|read|ack`. Session start lists pending handoffs for the lane
+  first, and tells the session to confirm with the user before acting on one.
+- **User-prompt hook.** `hooks/engram_userprompt_hook.sh` announces a handoff
+  that arrives mid-session on the next prompt, once per session, and prints
+  nothing otherwise. It runs `dist/handoff-cli.js`, which does not load the
+  vector store, so it starts in about 70 ms.
+
+### Changed
+
+- **Handoffs stay in their lane.** Session start, `memory-handoff-read`,
+  `memory-handoff-list` and the pre-compact freshness check only see the
+  session's own lane, and the latest handoff prefers the current project.
+  `lane` and `all` reach outside it.
+- **One checkpoint per session.** The stop hook writes
+  `handoffs/checkpoints/<session>.json` tagged with lane and project, removes
+  the shared `session-checkpoint.json`, and prunes checkpoints older than two
+  weeks.
+- **Handoffs from before lanes are left out.** They have no lane, so
+  lane-scoped reads skip them. `all: true` still reads them.
+
+### Fixed
+
+- **Same-second handoffs were invisible to stamp lookups.** A handoff written
+  in the same millisecond as another gets a `-2` suffix, which the stamp
+  pattern rejected, so reading it by stamp returned nothing.
+
 ## [1.5.1] - 2026-09-10
 
 Found by resuming a real session on 1.5.0.

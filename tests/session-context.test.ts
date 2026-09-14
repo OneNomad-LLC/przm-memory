@@ -10,7 +10,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -101,20 +101,62 @@ describe('buildSessionContext', () => {
     } finally { cleanup(); }
   });
 
-  it('prefers the crash checkpoint when it is newer than the last handoff', async () => {
+  it('prefers the crash checkpoint when it is newer than the last handoff in the lane', async () => {
     const { dir, cleanup } = tmpDir();
     try {
-      writeHandoff(dir, { sessionId: null, reason: 'manual', name: 'older', currentTask: 'the old task', completed: [], nextSteps: ['old next'], openQuestions: [], fileRefs: [], decisions: [], notes: '' });
+      writeHandoff(dir, { sessionId: null, reason: 'manual', name: 'older', lane: 'claude', currentTask: 'the old task', completed: [], nextSteps: ['old next'], openQuestions: [], fileRefs: [], decisions: [], notes: '' });
       backdate(dir, 'older', '2020-01-01T00:00:00.000Z');
-      // Exactly the file the stop hook writes: plain name, no stamp, no name field.
-      writeFileSync(join(dir, 'handoffs', 'session-checkpoint.json'), JSON.stringify({
-        timestamp: '2030-01-01T00:00:00.000Z', sessionId: 's', reason: 'context-pressure', currentTask: 'the crashed task',
+      // Exactly the file the stop hook writes: one per session, tagged with its lane.
+      mkdirSync(join(dir, 'handoffs', 'checkpoints'), { recursive: true });
+      writeFileSync(join(dir, 'handoffs', 'checkpoints', 's.json'), JSON.stringify({
+        timestamp: '2030-01-01T00:00:00.000Z', sessionId: 's', reason: 'context-pressure', lane: 'claude', currentTask: 'the crashed task',
         completed: [], nextSteps: [], openQuestions: [], fileRefs: [], decisions: [], notes: '',
       }));
-      const out = await buildSessionContext(fakeStorage([], []), dir);
+      // The rolling file every session used to share is not read any more.
+      writeFileSync(join(dir, 'handoffs', 'session-checkpoint.json'), JSON.stringify({
+        timestamp: '2031-01-01T00:00:00.000Z', sessionId: 'x', reason: 'context-pressure', currentTask: 'the shared legacy checkpoint',
+        completed: [], nextSteps: [], openQuestions: [], fileRefs: [], decisions: [], notes: '',
+      }));
+      const out = await buildSessionContext(fakeStorage([], []), dir, { lane: 'claude' });
       assert.match(out, /crash checkpoint/);
       assert.match(out, /the crashed task/);
       assert.doesNotMatch(out, /the old task/);
+      assert.doesNotMatch(out, /shared legacy checkpoint/);
+    } finally { cleanup(); }
+  });
+
+  it('keeps another lane\'s handoffs and checkpoints out of the session', async () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      const base = { sessionId: null, reason: 'manual' as const, completed: [], nextSteps: [], openQuestions: [], fileRefs: [], decisions: [], notes: '' };
+      writeHandoff(dir, { ...base, name: 'mine', lane: 'claude', currentTask: 'the personal task' });
+      backdate(dir, 'mine', '2026-01-01T00:00:00.000Z');
+      writeHandoff(dir, { ...base, name: 'theirs', lane: 'claude-work', currentTask: 'the work task' });
+      backdate(dir, 'theirs', '2026-06-01T00:00:00.000Z');
+      mkdirSync(join(dir, 'handoffs', 'checkpoints'), { recursive: true });
+      writeFileSync(join(dir, 'handoffs', 'checkpoints', 'w.json'), JSON.stringify({ ...base, timestamp: '2030-01-01T00:00:00.000Z', reason: 'context-pressure', lane: 'claude-work', currentTask: 'the work crash' }));
+
+      const out = await buildSessionContext(fakeStorage([], []), dir, { lane: 'claude' });
+      assert.match(out, /the personal task/);
+      assert.doesNotMatch(out, /the work task|the work crash/);
+    } finally { cleanup(); }
+  });
+
+  it('puts handoffs addressed to the lane first, and never shows them to the sender', async () => {
+    const { dir, cleanup } = tmpDir();
+    try {
+      const base = { sessionId: null, reason: 'manual' as const, completed: [], nextSteps: [], openQuestions: [], fileRefs: [], decisions: [], notes: '' };
+      writeHandoff(dir, { ...base, lane: 'claude-work', currentTask: 'the work resume note' });
+      writeHandoff(dir, { ...base, lane: 'claude', project: 'pryzm-ai-poc', to: 'claude-work', currentTask: 'push feature/gbp-data-freshness' });
+
+      const work = await buildSessionContext(fakeStorage([], []), dir, { lane: 'claude-work' });
+      assert.match(work, /## Handoffs waiting for you \(lane claude-work\)/);
+      assert.match(work, /from claude\/pryzm-ai-poc/);
+      assert.match(work, /confirm with the user before acting/);
+      assert.ok(work.indexOf('Handoffs waiting for you') < work.indexOf('the work resume note'));
+
+      const personal = await buildSessionContext(fakeStorage([], []), dir, { lane: 'claude' });
+      assert.doesNotMatch(personal, /push feature\/gbp-data-freshness/);
     } finally { cleanup(); }
   });
 
